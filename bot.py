@@ -26,6 +26,8 @@ WEBAPP_URL        = os.getenv("WEBAPP_URL")
 DB_PATH    = "pairmind.db"
 HTTP_PORT  = int(os.getenv('PORT', 8080))  # Railway задаёт PORT сам
 PRICE_STARS = 150      # цена за ОБЕ карточки (своя + партнёра)
+CHAT_FREE_DAILY = 8    # бесплатных сообщений AI-психологу в день
+CHAT_MSG_PRICE  = 10   # цена одного сообщения сверх лимита, ⭐
 UNLOCK_DAY  = 3        # карточка открывается на 3-й день
 CARD_TTL    = 3*24*3600*1000  # карточка обновляется каждые 3 дня (мс)
 
@@ -48,11 +50,21 @@ async def init_db():
             partner_code TEXT, partner_user_id INTEGER,
             card_paid INTEGER DEFAULT 0, card_paid_at INTEGER,
             partner_card TEXT, partner_card_at INTEGER,
-            my_card TEXT, my_card_at INTEGER)""")
+            my_card TEXT, my_card_at INTEGER,
+            chat_msgs_today INTEGER DEFAULT 0, chat_msgs_date TEXT,
+            chat_paid_extra INTEGER DEFAULT 0)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, role TEXT, content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # миграция: добавляем новые колонки, если таблица users создана раньше этого обновления
+        async with db.execute("PRAGMA table_info(users)") as c:
+            existing_cols = {row[1] for row in await c.fetchall()}
+        for col, decl in [("chat_msgs_today","INTEGER DEFAULT 0"),
+                           ("chat_msgs_date","TEXT"),
+                           ("chat_paid_extra","INTEGER DEFAULT 0")]:
+            if col not in existing_cols:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         await db.commit()
 
 async def get_user(uid):
@@ -90,6 +102,30 @@ async def get_user_texts(uid, limit=30):
         async with db.execute("SELECT content FROM messages WHERE user_id=? AND role='user' ORDER BY rowid DESC LIMIT ?",
                               (uid, limit)) as c:
             return [r[0] for r in await c.fetchall()]
+
+def today_str():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+async def check_and_consume_chat_msg(uid):
+    """Возвращает (allowed: bool, used_free: int, remaining_free: int, paid_extra: int).
+    Если сообщений в дневном лимите ещё нет — списывает бесплатное.
+    Если лимит исчерпан, но есть купленные сверху — списывает одно оплаченное.
+    Если нет ни того ни другого — allowed=False, отвечать нельзя, показываем оплату."""
+    u = await get_user(uid) or {}
+    date = u.get("chat_msgs_date")
+    used = u.get("chat_msgs_today") or 0
+    if date != today_str():
+        used = 0  # новый день — счётчик сбрасывается
+    paid_extra = u.get("chat_paid_extra") or 0
+
+    if used < CHAT_FREE_DAILY:
+        await save_user(uid, chat_msgs_today=used+1, chat_msgs_date=today_str())
+        return True, used+1, CHAT_FREE_DAILY-(used+1), paid_extra
+    if paid_extra > 0:
+        await save_user(uid, chat_msgs_today=used, chat_msgs_date=today_str(), chat_paid_extra=paid_extra-1)
+        return True, used, 0, paid_extra-1
+    await save_user(uid, chat_msgs_today=used, chat_msgs_date=today_str())
+    return False, used, 0, paid_extra
 
 def gen_code(uid):
     ch='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -267,21 +303,25 @@ async def ep_chat(request):
     mode = d.get("mode","chat")
     if not msg: return web.json_response({"error":"no message"}, status=400)
     if not uid: return web.json_response({"error":"открой через Telegram"}, status=400)
+    allowed, used, remaining, paid_extra = await check_and_consume_chat_msg(uid)
+    if not allowed:
+        return web.json_response({"need_payment": True, "price": CHAT_MSG_PRICE,
+                                   "reason": "chat_limit"})
     reply = await chat_reply(uid, msg, mode)
-    return web.json_response({"reply": reply})
+    return web.json_response({"reply": reply, "chat_remaining_free": remaining})
 
 async def ep_partner_card(request):
     uid = int(request.query.get("user_id",0))
     u = await get_user(uid)
     now = int(time.time()*1000)
     if not u: return web.json_response({"error":"нет профиля"}, status=400)
+    if not u.get("partner_user_id"):
+        return web.json_response({"no_partner": True})
     days = (now - (u.get("completed_at") or now)) / 86400000
     if days < (UNLOCK_DAY-1):
         return web.json_response({"locked": True, "days_left": round(UNLOCK_DAY-1-days,1)})
     if not u.get("card_paid"):
         return web.json_response({"need_payment": True, "price": PRICE_STARS})
-    if not u.get("partner_user_id"):
-        return web.json_response({"no_partner": True})
     p = await get_user(u["partner_user_id"])
     if not p or not p.get("ptype"):
         return web.json_response({"partner_no_profile": True})
@@ -323,6 +363,18 @@ async def ep_invoice(request):
         prices=[LabeledPrice("Две карточки", PRICE_STARS)])
     return web.json_response({"invoice_url": link})
 
+async def ep_chat_invoice(request):
+    d = await request.json()
+    uid = int(d.get("user_id",0))
+    bot = request.app["bot"]
+    link = await bot.create_invoice_link(
+        title="Сообщение AI-психологу",
+        description=f"Дневной лимит из {CHAT_FREE_DAILY} бесплатных сообщений исчерпан. Это разблокирует одно дополнительное сообщение.",
+        payload=f"chatmsg_{uid}",
+        currency="XTR",
+        prices=[LabeledPrice("1 сообщение", CHAT_MSG_PRICE)])
+    return web.json_response({"invoice_url": link})
+
 # ── Telegram handlers ────────────────────────────────────
 async def start(update: Update, ctx):
     uid = update.effective_user.id
@@ -336,6 +388,18 @@ async def on_message(update: Update, ctx):
     if not u or not u.get("ptype"):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌿 Пройти тест", web_app=WebAppInfo(url=WEBAPP_URL))]])
         await update.message.reply_text("Сначала пройди тест 🌿", reply_markup=kb); return
+    allowed, used, remaining, paid_extra = await check_and_consume_chat_msg(uid)
+    if not allowed:
+        link = await ctx.bot.create_invoice_link(
+            title="Сообщение AI-психологу",
+            description=f"Дневной лимит из {CHAT_FREE_DAILY} бесплатных сообщений исчерпан. Это разблокирует одно дополнительное сообщение.",
+            payload=f"chatmsg_{uid}", currency="XTR",
+            prices=[LabeledPrice("1 сообщение", CHAT_MSG_PRICE)])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Разблокировать за {CHAT_MSG_PRICE} ⭐", url=link)]])
+        await update.message.reply_text(
+            f"Бесплатный лимит на сегодня исчерпан ({CHAT_FREE_DAILY} сообщений). Новые появятся завтра, или разблокируй прямо сейчас:",
+            reply_markup=kb)
+        return
     await ctx.bot.send_chat_action(chat_id=uid, action="typing")
     reply = await chat_reply(uid, update.message.text)
     await update.message.reply_text(reply)
@@ -345,8 +409,14 @@ async def on_precheckout(update: Update, ctx):
 
 async def on_paid(update: Update, ctx):
     uid = update.effective_user.id
-    await save_user(uid, card_paid=1, card_paid_at=int(time.time()*1000))
-    await update.message.reply_text("✨ Обе карточки разблокированы! Открой приложение → вкладка Карточка.")
+    payload = update.message.successful_payment.invoice_payload or ""
+    if payload.startswith("chatmsg_"):
+        u = await get_user(uid) or {}
+        await save_user(uid, chat_paid_extra=(u.get("chat_paid_extra") or 0)+1)
+        await update.message.reply_text("✨ Сообщение разблокировано! Возвращайся в чат.")
+    else:
+        await save_user(uid, card_paid=1, card_paid_at=int(time.time()*1000))
+        await update.message.reply_text("✨ Обе карточки разблокированы! Открой приложение → вкладка Карточка.")
 
 # ── Main ─────────────────────────────────────────────────
 async def main():
@@ -366,7 +436,8 @@ async def main():
     app_web.router.add_get('/partner_card', ep_partner_card)
     app_web.router.add_get('/my_card', ep_my_card)
     app_web.router.add_post('/create_invoice', ep_invoice)
-    for route in ['/profile','/save_profile','/link_partner','/chat','/partner_card','/my_card','/create_invoice']:
+    app_web.router.add_post('/create_chat_invoice', ep_chat_invoice)
+    for route in ['/profile','/save_profile','/link_partner','/chat','/partner_card','/my_card','/create_invoice','/create_chat_invoice']:
         app_web.router.add_route('OPTIONS', route, lambda r: web.Response())
     runner = web.AppRunner(app_web); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', HTTP_PORT).start()
