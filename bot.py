@@ -57,6 +57,11 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, role TEXT, content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_uid INTEGER, to_uid INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER)""")
         # миграция: добавляем новые колонки, если таблица users создана раньше этого обновления
         async with db.execute("PRAGMA table_info(users)") as c:
             existing_cols = {row[1] for row in await c.fetchall()}
@@ -103,6 +108,52 @@ async def get_user_texts(uid, limit=30):
                               (uid, limit)) as c:
             return [r[0] for r in await c.fetchall()]
 
+async def find_user_by_username(username):
+    """username без @, регистронезависимо"""
+    username = username.lstrip('@').strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE LOWER(username)=?", (username,)) as c:
+            r = await c.fetchone()
+            return dict(r) if r else None
+
+async def create_invite(from_uid, to_uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # если уже есть висящее приглашение между этими же двумя людьми — не плодим дубликаты
+        async with db.execute(
+            "SELECT id FROM invites WHERE from_uid=? AND to_uid=? AND status='pending'",
+            (from_uid, to_uid)) as c:
+            existing = await c.fetchone()
+        if existing:
+            return existing[0]
+        cur = await db.execute(
+            "INSERT INTO invites (from_uid,to_uid,status,created_at) VALUES (?,?,?,?)",
+            (from_uid, to_uid, 'pending', int(time.time()*1000)))
+        await db.commit()
+        return cur.lastrowid
+
+async def get_invite(invite_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM invites WHERE id=?", (invite_id,)) as c:
+            r = await c.fetchone()
+            return dict(r) if r else None
+
+async def set_invite_status(invite_id, status):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE invites SET status=? WHERE id=?", (status, invite_id))
+        await db.commit()
+
+async def get_pending_invite_from(from_uid):
+    """Есть ли у меня отправленное и всё ещё висящее приглашение (для статуса на фронте)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM invites WHERE from_uid=? AND status='pending' ORDER BY id DESC LIMIT 1",
+            (from_uid,)) as c:
+            r = await c.fetchone()
+            return dict(r) if r else None
+
 def today_str():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
@@ -127,10 +178,6 @@ async def check_and_consume_chat_msg(uid):
     await save_user(uid, chat_msgs_today=used, chat_msgs_date=today_str())
     return False, used, 0, paid_extra
 
-def gen_code(uid):
-    ch='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    s=str(uid)
-    return ''.join(ch[(int(s[i%len(s)])+i*7)%len(ch)] for i in range(6))
 
 # ── AI ───────────────────────────────────────────────────
 async def ask_ai(system, messages, max_tokens=280):
@@ -235,16 +282,20 @@ async def ep_profile(request):
     uid = int(request.query.get('user_id', 0))
     u = await get_user(uid)
     now = int(time.time()*1000)
-    profile = None; partner = {"linked": False, "has_profile": False}; card = {}
+    profile = None; partner = {"linked": False, "has_profile": False, "pending_invite": None}; card = {}
     if u:
-        if not u.get("partner_code"):
-            await save_user(uid, partner_code=gen_code(uid)); u = await get_user(uid)
         if u.get("ptype"):
-            profile = {k: u.get(k) for k in ("ptype","pname","trigger","conflict","insight","completed_at","partner_code")}
+            profile = {k: u.get(k) for k in ("ptype","pname","trigger","conflict","insight","completed_at")}
         if u.get("partner_user_id"):
             p = await get_user(u["partner_user_id"])
             partner = {"linked": True, "has_profile": bool(p and p.get("ptype")),
-                       "ptype": p.get("ptype") if p else None, "pname": p.get("pname") if p else None}
+                       "ptype": p.get("ptype") if p else None, "pname": p.get("pname") if p else None,
+                       "pending_invite": None}
+        else:
+            inv = await get_pending_invite_from(uid)
+            if inv:
+                to_user = await get_user(inv["to_uid"])
+                partner["pending_invite"] = {"username": (to_user or {}).get("username","")}
         days = (now - (u.get("completed_at") or now)) / 86400000
         card = {"day_unlocked": days >= (UNLOCK_DAY-1), "days_left": max(0, round(UNLOCK_DAY-1-days, 1)),
                 "paid": bool(u.get("card_paid")), "price": PRICE_STARS}
@@ -275,27 +326,41 @@ async def ep_save_profile(request):
 
     await save_user(uid, ptype=ptype, pname=pname,
         trigger=trigger, conflict=conflict,
-        insight=insight, completed_at=completed,
-        partner_code=gen_code(uid))
-    return web.json_response({"ok": True, "partner_code": gen_code(uid),
+        insight=insight, completed_at=completed)
+    return web.json_response({"ok": True,
                                "trigger": trigger, "conflict": conflict, "insight": insight})
 
-async def ep_link_partner(request):
+async def ep_send_invite(request):
     d = await request.json()
-    uid, code = int(d.get("user_id",0)), (d.get("code") or "").strip().upper()
-    if not uid or len(code) < 6:
-        return web.json_response({"error":"Введи код из 6 символов"}, status=400)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT user_id FROM users WHERE partner_code=?", (code,)) as c:
-            row = await c.fetchone()
-    if not row or row["user_id"] == uid:
-        return web.json_response({"error":"Код не найден"}, status=404)
-    pid = row["user_id"]
-    await save_user(uid, partner_user_id=pid)
-    await save_user(pid, partner_user_id=uid)
-    p = await get_user(pid)
-    return web.json_response({"ok": True, "partner_has_profile": bool(p.get("ptype"))})
+    uid = int(d.get("user_id",0))
+    username = (d.get("username") or "").strip()
+    if not uid or not username:
+        return web.json_response({"error":"Введи Telegram-username партнёра"}, status=400)
+    me = await get_user(uid)
+    if me and me.get("partner_user_id"):
+        return web.json_response({"error":"Ты уже связан с партнёром"}, status=400)
+    target = await find_user_by_username(username)
+    if not target:
+        return web.json_response({"error":"Этот человек ещё не запускал бота. Попроси его сначала нажать /start у @PairMind"}, status=404)
+    if target["user_id"] == uid:
+        return web.json_response({"error":"Нельзя пригласить самого себя"}, status=400)
+    if target.get("partner_user_id"):
+        return web.json_response({"error":"Этот человек уже связан с кем-то"}, status=400)
+    invite_id = await create_invite(uid, target["user_id"])
+    bot = request.app["bot"]
+    me_name = (me or {}).get("username") or "кто-то"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💌 Принять", callback_data=f"inv_accept_{invite_id}"),
+        InlineKeyboardButton("Отклонить", callback_data=f"inv_decline_{invite_id}")
+    ]])
+    try:
+        await bot.send_message(
+            chat_id=target["user_id"],
+            text=f"💌 @{me_name} приглашает тебя в PairMind — связать профили, чтобы видеть карточку друг друга.",
+            reply_markup=kb)
+    except Exception as e:
+        return web.json_response({"error":"Не удалось отправить приглашение. Возможно, этот человек заблокировал бота."}, status=400)
+    return web.json_response({"ok": True, "sent_to": username})
 
 async def ep_chat(request):
     d = await request.json()
@@ -378,7 +443,7 @@ async def ep_chat_invoice(request):
 # ── Telegram handlers ────────────────────────────────────
 async def start(update: Update, ctx):
     uid = update.effective_user.id
-    await save_user(uid, username=update.effective_user.username or "", partner_code=gen_code(uid))
+    await save_user(uid, username=update.effective_user.username or "")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌿 Открыть PairMind", web_app=WebAppInfo(url=WEBAPP_URL))]])
     await update.message.reply_text("Привет 👋\n\nPairMind — AI-психолог для пар.\nНажми кнопку чтобы начать:", reply_markup=kb)
 
@@ -418,6 +483,40 @@ async def on_paid(update: Update, ctx):
         await save_user(uid, card_paid=1, card_paid_at=int(time.time()*1000))
         await update.message.reply_text("✨ Обе карточки разблокированы! Открой приложение → вкладка Карточка.")
 
+async def on_invite_response(update: Update, ctx):
+    q = update.callback_query
+    await q.answer()
+    action, invite_id = q.data.rsplit('_', 1)  # 'inv_accept' | 'inv_decline', id
+    invite_id = int(invite_id)
+    invite = await get_invite(invite_id)
+    if not invite or invite["status"] != "pending":
+        await q.edit_message_text("Это приглашение уже недействительно.")
+        return
+    if q.from_user.id != invite["to_uid"]:
+        return  # кнопку жмёт не тот человек — игнорируем молча
+    if action == "inv_decline":
+        await set_invite_status(invite_id, "declined")
+        await q.edit_message_text("Приглашение отклонено.")
+        try:
+            await ctx.bot.send_message(invite["from_uid"], "Партнёр отклонил приглашение в PairMind.")
+        except Exception:
+            pass
+        return
+    # inv_accept
+    from_u = await get_user(invite["from_uid"])
+    if from_u and from_u.get("partner_user_id"):
+        await q.edit_message_text("У приглашавшего уже есть партнёр — приглашение устарело.")
+        await set_invite_status(invite_id, "declined")
+        return
+    await set_invite_status(invite_id, "accepted")
+    await save_user(invite["from_uid"], partner_user_id=invite["to_uid"])
+    await save_user(invite["to_uid"], partner_user_id=invite["from_uid"])
+    await q.edit_message_text("💛 Вы связаны в PairMind! Открой приложение → вкладка Карточка.")
+    try:
+        await ctx.bot.send_message(invite["from_uid"], "💛 Партнёр принял приглашение! Вы связаны в PairMind.")
+    except Exception:
+        pass
+
 # ── Main ─────────────────────────────────────────────────
 async def main():
     await init_db()
@@ -426,18 +525,19 @@ async def main():
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app_tg.add_handler(PreCheckoutQueryHandler(on_precheckout))
     app_tg.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+    app_tg.add_handler(CallbackQueryHandler(on_invite_response, pattern=r'^inv_(accept|decline)_\d+$'))
 
     app_web = web.Application(middlewares=[cors_mw])
     app_web["bot"] = app_tg.bot
     app_web.router.add_get('/profile', ep_profile)
     app_web.router.add_post('/save_profile', ep_save_profile)
-    app_web.router.add_post('/link_partner', ep_link_partner)
+    app_web.router.add_post('/send_invite', ep_send_invite)
     app_web.router.add_post('/chat', ep_chat)
     app_web.router.add_get('/partner_card', ep_partner_card)
     app_web.router.add_get('/my_card', ep_my_card)
     app_web.router.add_post('/create_invoice', ep_invoice)
     app_web.router.add_post('/create_chat_invoice', ep_chat_invoice)
-    for route in ['/profile','/save_profile','/link_partner','/chat','/partner_card','/my_card','/create_invoice','/create_chat_invoice']:
+    for route in ['/profile','/save_profile','/send_invite','/chat','/partner_card','/my_card','/create_invoice','/create_chat_invoice']:
         app_web.router.add_route('OPTIONS', route, lambda r: web.Response())
     runner = web.AppRunner(app_web); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', HTTP_PORT).start()
