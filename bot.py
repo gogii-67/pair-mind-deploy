@@ -46,6 +46,7 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT,
             ptype TEXT, pname TEXT, trigger TEXT, conflict TEXT, insight TEXT,
+            superpower TEXT, in_love TEXT, first_name TEXT,
             completed_at INTEGER,
             partner_code TEXT, partner_user_id INTEGER,
             card_paid INTEGER DEFAULT 0, card_paid_at INTEGER,
@@ -67,7 +68,10 @@ async def init_db():
             existing_cols = {row[1] for row in await c.fetchall()}
         for col, decl in [("chat_msgs_today","INTEGER DEFAULT 0"),
                            ("chat_msgs_date","TEXT"),
-                           ("chat_paid_extra","INTEGER DEFAULT 0")]:
+                           ("chat_paid_extra","INTEGER DEFAULT 0"),
+                           ("superpower","TEXT"),
+                           ("in_love","TEXT"),
+                           ("first_name","TEXT")]:
             if col not in existing_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         await db.commit()
@@ -204,13 +208,25 @@ async def chat_reply(uid, message, mode="chat"):
     history = await get_history(uid)
     system = f"{BASE_PROMPT}\nТип пользователя: {u.get('ptype','?') if u else '?'} — {u.get('pname','') if u else ''}. Триггер: {u.get('trigger','?') if u else '?'}."
 
-    if mode == "partner_card" and u and u.get("partner_user_id"):
+    # Контекст о партнёре — доступен в ЛЮБОМ режиме чата, если партнёр привязан
+    if u and u.get("partner_user_id"):
         p = await get_user(u["partner_user_id"])
         if p:
+            pname_h = p.get('first_name') or ''
+            card_text = (u.get("partner_card") or "")[:900]
             system += f"""
-Сейчас пользователь смотрит карточку своего партнёра и задаёт вопросы о нём.
-Партнёр: тип {p.get('ptype','?')} — {p.get('pname','')}. Триггер: {p.get('trigger','?')}. В конфликте: {p.get('conflict','?')}.
-Объясняй что важно партнёру, почему он так реагирует, и предлагай конкретные решения."""
+
+ДАННЫЕ О ПАРТНЁРЕ ПОЛЬЗОВАТЕЛЯ (используй, когда разговор касается партнёра или отношений с ним):
+Имя: {pname_h or 'не указано'}. Тип: {p.get('ptype','?')} — {p.get('pname','')}. Особенность: {p.get('superpower') or '—'}. Триггер: {p.get('trigger','?')}. В любви: {p.get('in_love') or '—'}. В конфликте: {p.get('conflict','?')}."""
+            if card_text:
+                system += f"""
+Карточка партнёра (что ему приятно и какие действия зайдут — опирайся на неё в советах, можешь предлагать конкретные пункты из неё):
+{card_text}"""
+            system += """
+Определяй род партнёра по имени и говори о нём/ней в правильном роде. Не выдумывай факты о партнёре сверх этих данных."""
+
+    if mode == "partner_card" and u and u.get("partner_user_id"):
+        system += "\nСейчас пользователь смотрит карточку партнёра и задаёт вопросы именно о нём — отвечай через призму карточки, предлагай конкретные действия из неё."
 
     await save_msg(uid, "user", message)
     reply = await ask_ai(system, history + [{"role":"user","content":message}])
@@ -218,20 +234,57 @@ async def chat_reply(uid, message, mode="chat"):
     return reply
 
 async def generate_traits(ptype, pname, scores, answers):
-    """AI генерирует триггер/конфликт/инсайт под конкретные баллы, чтобы результаты не повторялись у людей одного типа"""
+    """AI генерирует все 5 плашек результата под конкретные баллы, чтобы результаты не повторялись у людей одного типа"""
     system = ("Ты — тонкий психолог по теории привязанности, пишешь на русском для мобильного приложения. "
-               "Без markdown, без звёздочек, без списков. Живой, тёплый, конкретный тон — не общие фразы.")
+               "Без markdown, без звёздочек, без списков. Живой, тёплый, конкретный тон — не общие фразы. "
+               "Примеры ниже показывают ДИАПАЗОН стиля и длины — никогда не копируй их дословно, "
+               "твой текст должен быть новым и точно попадать в баллы конкретного человека.")
     prompt = f"""Психотип человека по тесту: {ptype} ({pname}).
 Сырые баллы по шкалам (чем выше — тем сильнее выражено): избегание={scores['AV']}, тревожность={scores['AN']}, интроверсия={scores['I']}, эмоциональность={scores['F']}.
 Ответы на 8 вопросов теста (индексы вариантов 0-3): {answers}
 
-Сгенерируй три поля JSON, каждое максимально конкретное именно под ЭТИ баллы (не общие фразы про тип в целом — два человека одного типа с разными баллами должны получить заметно разный текст):
-- trigger: 3-6 слов, что именно выбивает из колеи (используй конкретную деталь, не шаблон)
-- conflict: 4-8 слов, поведенческий паттерн в момент конфликта
-- insight: 1-2 предложения, неочевидное наблюдение о человеке, которое цепляет и звучит правдиво лично для него
+Сгенерируй пять полей JSON для карточек результата в приложении. Каждое поле — максимально конкретное именно под ЭТИ баллы (не общие фразы про тип в целом — два человека одного типа с разными баллами должны получить заметно разный текст). Каждое поле короткое, помещается в маленькую плашку интерфейса.
 
-Ответь СТРОГО валидным JSON без markdown-обёртки: {{"trigger":"...","conflict":"...","insight":"..."}}"""
-    raw = await ask_ai(system, [{"role":"user","content":prompt}], max_tokens=300)
+feature (2-4 слова) — конкретная особенность человека в отношениях, вытекающая именно из этих баллов. Примеры диапазона (не копировать):
+1. "Держит слово даже в кризис"
+2. "Ловит настроение с полуслова"
+3. "Не бросает на середине ссоры"
+4. "Умеет молчать рядом, не отдаляясь"
+5. "Замечает, что не сказано вслух"
+6. "Даёт партнёру пространство без обид"
+7. "Быстро отходит, не держит зла"
+
+trigger (3-6 слов) — что именно выбивает из колеи, конкретная деталь. Примеры диапазона:
+1. "Когда его перебивают на полуслове"
+2. "Резкий тон без объяснений"
+3. "Молчание дольше пары часов"
+4. "Когда решения принимают за него"
+5. "Сарказм вместо прямого разговора"
+6. "Чувство что от него что-то скрывают"
+7. "Когда его усилия обесценивают"
+
+in_love (2-4 слова) — что человек даёт партнёру, как проявляет любовь. Примеры диапазона:
+1. "Заботится незаметно, без слов"
+2. "Обнимает первым после ссоры"
+3. "Помнит мелкие детали о тебе"
+4. "Защищает от чужого мнения"
+5. "Даёт время, не торопит"
+6. "Говорит прямо, что чувствует"
+7. "Остаётся рядом в трудный день"
+
+conflict (4-8 слов) — поведенческий паттерн именно в момент конфликта. Примеры диапазона:
+1. "Уходит в другую комнату остыть"
+2. "Говорит громче, потом сам жалеет"
+3. "Задаёт вопросы, чтобы понять причину"
+4. "Соглашается вслух, обижается внутри"
+5. "Требует немедленного разговора начистоту"
+6. "Замыкается на день-два, потом оттаивает"
+7. "Шутит, чтобы снизить напряжение"
+
+insight (1-2 предложения) — неочевидное наблюдение о человеке, которое цепляет и звучит правдиво лично для него, не общая фраза про тип.
+
+Ответь СТРОГО валидным JSON без markdown-обёртки: {{"feature":"...","trigger":"...","in_love":"...","conflict":"...","insight":"..."}}"""
+    raw = await ask_ai(system, [{"role":"user","content":prompt}], max_tokens=400)
     try:
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         return json.loads(cleaned)
@@ -239,26 +292,61 @@ async def generate_traits(ptype, pname, scores, answers):
         return None
 
 async def generate_card(target_uid, viewer_is_partner):
-    """Карточка: профиль + инсайты из переписки"""
+    """Карточка: профиль + инсайты из переписки. Тон — тёплый друг, не психолог."""
     t = await get_user(target_uid)
     if not t or not t.get("ptype"):
         return None
     texts = await get_user_texts(target_uid)
-    convo = "\n".join(f"— {x}" for x in texts[:25]) or "— (ещё не общался с психологом)"
-    who = "о партнёре пользователя" if viewer_is_partner else "о самом пользователе"
-    system = "Ты пишешь короткую психологическую карточку на русском. Без markdown и звёздочек."
-    prompt = f"""Составь карточку {who}.
-Тип: {t.get('ptype')} — {t.get('pname')}. Триггер: {t.get('trigger')}. В конфликте: {t.get('conflict')}.
-Фразы из его разговоров с психологом:
-{convo}
+    convo = "\n".join(f"— {x}" for x in texts[:25]) or "— (ещё не общался с AI)"
+    system = ("Ты — тёплый наблюдательный друг, который очень хорошо знает этого человека. "
+               "Пишешь на русском просто, конкретно и по-доброму. Никаких профессиональных рекомендаций, "
+               "терминов и диагнозов — только живые дружеские советы. Без markdown и звёздочек.")
+    profile_block = f"""Имя: {t.get('first_name') or 'не указано'}
+Тип: {t.get('ptype')} — {t.get('pname')}
+Особенность: {t.get('superpower') or '—'}
+Триггер: {t.get('trigger')}
+В любви: {t.get('in_love') or '—'}
+В конфликте: {t.get('conflict')}
+Инсайт: {t.get('insight')}
+Его фразы из переписки с AI (опирайся на настроение и темы, но не цитируй дословно):
+{convo}"""
+    if viewer_is_partner:
+        prompt = f"""Составь карточку-подсказку для человека о его ПАРТНЁРЕ — что партнёру приятно и какие действия в его сторону зайдут лучше всего.
 
-Структура (каждый раздел с новой строки, заголовок заглавными):
-ЧТО ЕГО БЕСПОКОИТ — 2-3 предложения на основе разговоров
-В ЧЁМ НУЖДАЕТСЯ — 2-3 предложения
-ТРИГГЕРЫ — что ранит, чего избегать
-КАК ПОДДЕРЖАТЬ — 3 конкретных совета
-Максимум 200 слов всего."""
-    return await ask_ai(system, [{"role":"user","content":prompt}], max_tokens=450)
+{profile_block}
+
+ВАЖНО ПРО РОД: определи род по имени партнёра. Если имя женское (Маша, Аня, Муся и т.п.) — пиши в женском роде везде, включая заголовки: «ЧТО ЕЙ ПРИЯТНО», «она тает», «скажи ей». Если мужское — в мужском. Если имя не указано или непонятно — используй мужской род. Можешь один-два раза обратиться по имени в тексте — это делает карточку личной.
+
+Структура ответа (заголовки СТРОГО ЗАГЛАВНЫМИ с новой строки, каждое действие с новой строки начинай с "— "):
+ЧТО ЕМУ ПРИЯТНО (или ЧТО ЕЙ ПРИЯТНО — по роду)
+2-3 предложения: от чего он/она тает, что делает его/её день лучше.
+ПРИЯТНЫЕ ДЕЙСТВИЯ
+— 4-5 конкретных простых действий, которые можно сделать уже сегодня или завтра
+ФРАЗЫ КОТОРЫЕ ЗАЙДУТ
+— 2-3 конкретные фразы, которые можно сказать прямо словами
+ЧЕГО ЛУЧШЕ НЕ ДЕЛАТЬ
+— 2-3 пункта, мягко и без осуждения
+
+Обращайся к читателю на "ты". Максимум 220 слов."""
+    else:
+        prompt = f"""Составь тёплую карточку для человека О НЁМ САМОМ — как записку от друга, который его хорошо знает.
+
+{profile_block}
+
+ВАЖНО ПРО РОД: определи род по имени. Если имя женское — пиши в женском роде («ты сильная», «тебе приятно, когда тебя слышат»). Если мужское или непонятно — в мужском.
+
+Структура ответа (заголовки СТРОГО ЗАГЛАВНЫМИ с новой строки, пункты начинай с "— "):
+ТВОЯ СИЛЬНАЯ СТОРОНА
+2-3 предложения о том, что в нём ценно в отношениях.
+ЧТО ТЕБЕ ПРИЯТНО
+2-3 предложения: что наполняет его, о чём стоит прямо говорить партнёру.
+ПОПРОБУЙ НА ЭТОЙ НЕДЕЛЕ
+— 3-4 конкретных маленьких шага в отношениях
+СЕБЕ НА ЗАМЕТКУ
+1-2 предложения мягкого напоминания без нравоучений.
+
+Обращайся к читателю на "ты". Максимум 200 слов."""
+    return await ask_ai(system, [{"role":"user","content":prompt}], max_tokens=520)
 
 # ── HTTP API ─────────────────────────────────────────────
 def cors(resp):
@@ -285,7 +373,8 @@ async def ep_profile(request):
     profile = None; partner = {"linked": False, "has_profile": False, "pending_invite": None}; card = {}
     if u:
         if u.get("ptype"):
-            profile = {k: u.get(k) for k in ("ptype","pname","trigger","conflict","insight","completed_at")}
+            profile = {k: u.get(k) for k in ("ptype","pname","trigger","conflict","insight","in_love","completed_at")}
+            profile["feature"] = u.get("superpower")
         if u.get("partner_user_id"):
             p = await get_user(u["partner_user_id"])
             partner = {"linked": True, "has_profile": bool(p and p.get("ptype")),
@@ -314,6 +403,7 @@ async def ep_save_profile(request):
     answers = d.get("answers") or []
 
     trigger, conflict, insight = d.get("trigger",""), d.get("conflict",""), d.get("insight","")
+    feature, in_love = d.get("feature",""), d.get("in_love","")
     if scores and answers:
         try:
             traits = await generate_traits(ptype, pname, scores, answers)
@@ -321,14 +411,17 @@ async def ep_save_profile(request):
                 trigger = traits.get("trigger", trigger)
                 conflict = traits.get("conflict", conflict)
                 insight = traits.get("insight", insight)
+                feature = traits.get("feature", feature)
+                in_love = traits.get("in_love", in_love)
         except Exception as e:
             print("generate_traits failed, falling back to defaults:", e)
 
     await save_user(uid, ptype=ptype, pname=pname,
         trigger=trigger, conflict=conflict,
-        insight=insight, completed_at=completed)
-    return web.json_response({"ok": True,
-                               "trigger": trigger, "conflict": conflict, "insight": insight})
+        insight=insight, superpower=feature, in_love=in_love,
+        completed_at=completed)
+    return web.json_response({"ok": True, "trigger": trigger, "conflict": conflict,
+                               "insight": insight, "feature": feature, "in_love": in_love})
 
 async def ep_send_invite(request):
     d = await request.json()
@@ -361,6 +454,21 @@ async def ep_send_invite(request):
     except Exception as e:
         return web.json_response({"error":"Не удалось отправить приглашение. Возможно, этот человек заблокировал бота."}, status=400)
     return web.json_response({"ok": True, "sent_to": username})
+
+async def ep_unlink_partner(request):
+    d = await request.json()
+    uid = int(d.get("user_id",0))
+    u = await get_user(uid)
+    if not u or not u.get("partner_user_id"):
+        return web.json_response({"error":"Партнёр не привязан"}, status=400)
+    pid = u["partner_user_id"]
+    await save_user(uid, partner_user_id=None, partner_card=None, partner_card_at=None)
+    await save_user(pid, partner_user_id=None, partner_card=None, partner_card_at=None)
+    try:
+        await request.app["bot"].send_message(pid, "Партнёр разорвал связь в PairMind. Карточка партнёра больше недоступна.")
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
 
 async def ep_chat(request):
     d = await request.json()
@@ -424,6 +532,7 @@ async def ep_invoice(request):
         title="Две карточки PairMind",
         description="Твоя карточка + карточка партнёра: что беспокоит, в чём нуждаетесь, триггеры и как поддержать друг друга. Обновляются каждые 3 дня.",
         payload=f"cards_{uid}",
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice("Две карточки", PRICE_STARS)])
     return web.json_response({"invoice_url": link})
@@ -436,6 +545,7 @@ async def ep_chat_invoice(request):
         title="Сообщение AI-психологу",
         description=f"Дневной лимит из {CHAT_FREE_DAILY} бесплатных сообщений исчерпан. Это разблокирует одно дополнительное сообщение.",
         payload=f"chatmsg_{uid}",
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice("1 сообщение", CHAT_MSG_PRICE)])
     return web.json_response({"invoice_url": link})
@@ -443,13 +553,16 @@ async def ep_chat_invoice(request):
 # ── Telegram handlers ────────────────────────────────────
 async def start(update: Update, ctx):
     uid = update.effective_user.id
-    await save_user(uid, username=update.effective_user.username or "")
+    await save_user(uid, username=update.effective_user.username or "",
+                     first_name=update.effective_user.first_name or "")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌿 Открыть PairMind", web_app=WebAppInfo(url=WEBAPP_URL))]])
     await update.message.reply_text("Привет 👋\n\nPairMind — AI-психолог для пар.\nНажми кнопку чтобы начать:", reply_markup=kb)
 
 async def on_message(update: Update, ctx):
     uid = update.effective_user.id
     u = await get_user(uid)
+    if u and not u.get("first_name"):
+        await save_user(uid, first_name=update.effective_user.first_name or "")
     if not u or not u.get("ptype"):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌿 Пройти тест", web_app=WebAppInfo(url=WEBAPP_URL))]])
         await update.message.reply_text("Сначала пройди тест 🌿", reply_markup=kb); return
@@ -458,7 +571,7 @@ async def on_message(update: Update, ctx):
         link = await ctx.bot.create_invoice_link(
             title="Сообщение AI-психологу",
             description=f"Дневной лимит из {CHAT_FREE_DAILY} бесплатных сообщений исчерпан. Это разблокирует одно дополнительное сообщение.",
-            payload=f"chatmsg_{uid}", currency="XTR",
+            payload=f"chatmsg_{uid}", provider_token="", currency="XTR",
             prices=[LabeledPrice("1 сообщение", CHAT_MSG_PRICE)])
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Разблокировать за {CHAT_MSG_PRICE} ⭐", url=link)]])
         await update.message.reply_text(
@@ -532,12 +645,13 @@ async def main():
     app_web.router.add_get('/profile', ep_profile)
     app_web.router.add_post('/save_profile', ep_save_profile)
     app_web.router.add_post('/send_invite', ep_send_invite)
+    app_web.router.add_post('/unlink_partner', ep_unlink_partner)
     app_web.router.add_post('/chat', ep_chat)
     app_web.router.add_get('/partner_card', ep_partner_card)
     app_web.router.add_get('/my_card', ep_my_card)
     app_web.router.add_post('/create_invoice', ep_invoice)
     app_web.router.add_post('/create_chat_invoice', ep_chat_invoice)
-    for route in ['/profile','/save_profile','/send_invite','/chat','/partner_card','/my_card','/create_invoice','/create_chat_invoice']:
+    for route in ['/profile','/save_profile','/send_invite','/unlink_partner','/chat','/partner_card','/my_card','/create_invoice','/create_chat_invoice']:
         app_web.router.add_route('OPTIONS', route, lambda r: web.Response())
     runner = web.AppRunner(app_web); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', HTTP_PORT).start()
